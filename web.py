@@ -28,6 +28,7 @@ from note_skill import note_rules
 from note_exports import note_reply
 from document_input import DocumentReader, MAX_BATCH_BYTES, MAX_TEXT
 from library import validate_refs, fingerprint
+from formula_matrix import generate as generate_matrix_latex
 from file_preview import PdfPreviews
 from library_export import export_collection
 from math_text import normalize_math_markdown
@@ -44,6 +45,7 @@ class LockedTools:
     def __init__(self, local):
         self.local = local
         self.lock = threading.RLock()
+        self.progress = local.progress
 
     def execute(self, name, arguments, cancel_token=None):
         with self.lock:
@@ -59,7 +61,7 @@ class LockedTools:
 
     def list_mistakes(self):
         with self.lock:
-            return self.local.get_mistakes(limit=200)
+            return self.local.get_mistakes(limit=None)
 
     def review_catalog(self):
         with self.lock:
@@ -206,6 +208,7 @@ def create_app(data_dir=None, client_factory=None, reader_factory=None, settings
         if not state["lock"].acquire(blocking=False):
             return None
         token = CancellationToken()
+        token.request_id=request_id
         with states_lock:
             state["token"] = token
             state["request_id"] = request_id
@@ -288,6 +291,62 @@ def create_app(data_dir=None, client_factory=None, reader_factory=None, settings
         except (ValueError, OSError) as exc:
             return error(str(exc))
 
+    def review_payload(state):
+        agent=state["agents"].get("review")
+        return agent.review_snapshot() if agent else {"round_id":None,"seen_ids":[],"current_attempt":None,"selection":None}
+
+    @app.get("/api/review/progress")
+    def review_progress():
+        from review_progress import ERROR_TYPES
+        try:
+            state=get_state()
+            return jsonify(ok=True,review=review_payload(state),progress=tools.progress.summary(),error_types=ERROR_TYPES)
+        except (ValueError,OSError) as exc:
+            return error(str(exc))
+
+    @app.get("/api/review/history")
+    def review_history():
+        try:
+            question_id=request.args.get("question_id")
+            offset=int(request.args.get("offset","0"));limit=int(request.args.get("limit","20"))
+            if offset<0 or not 1<=limit<=100 or question_id is not None and (not question_id or len(question_id)>120):
+                raise ValueError("做题记录查询范围无效。")
+            return jsonify(ok=True,**tools.progress.history(question_id,offset,limit))
+        except (ValueError,OSError) as exc:
+            return error(str(exc))
+
+    @app.post("/api/review/result")
+    def correct_review_result():
+        payload=request.get_json(silent=True)
+        fields={"attempt_id","outcome","assisted","error_tags","evidence"}
+        if not isinstance(payload,dict) or set(payload)!=fields:
+            return error("请选择做题情况并提供判定依据。")
+        state=get_state()
+        if not state["lock"].acquire(blocking=False):return error("请先停止当前请求，再核对做题记录。",409)
+        try:
+            agent=state["agents"].get("review")
+            if not agent or not agent.current_attempt_id:return error("请先选择并尝试一道题。",409)
+            if payload["attempt_id"]!=agent.current_attempt_id:return error("当前题已改变，请重新打开本题记录后再确认。",409)
+            tools.progress.assess(agent.current_attempt_id,**{k:v for k,v in payload.items() if k!="attempt_id"},source="user")
+            return jsonify(ok=True,review=review_payload(state),progress=tools.progress.summary())
+        except (ValueError,TypeError,OSError) as exc:
+            return error(str(exc))
+        finally:state["lock"].release()
+
+    @app.post("/api/review/end")
+    def end_review():
+        state=get_state()
+        if not state["lock"].acquire(blocking=False):return error("请先停止当前请求，再结束本轮。",409)
+        try:
+            agent=state["agents"].get("review")
+            if agent:agent.end_review()
+            state["agents"].pop("review",None)
+            state["review_images"].clear();state["review_transcriptions"].clear()
+            return jsonify(ok=True,review=review_payload(state),progress=tools.progress.summary())
+        except (ValueError,OSError) as exc:
+            return error(str(exc))
+        finally:state["lock"].release()
+
     @app.post("/api/review/select")
     def select_review():
         from review_catalog import validate_filter
@@ -310,12 +369,12 @@ def create_app(data_dir=None, client_factory=None, reader_factory=None, settings
             # Picking is a local read, so a model/API key is not needed here.
             agent = StudyAgent(None, tools, trace=lambda event,value:events.append({"event":event,"value":value}))
             previous = state["agents"].get("review")
-            if previous and previous.review_filter == selection:
-                agent.last_exercise_id = previous.last_exercise_id
+            if previous:
+                agent.inherit_review_round(previous)
             answer = agent.start_review(selection, token)
             token.check();state["agents"]["review"] = agent
             state["review_images"].clear();state["review_transcriptions"].clear()
-            return jsonify(ok=True, answer=answer, events=events, selection=selection, current_question=agent.current_question)
+            return jsonify(ok=True, answer=answer, events=events, selection=selection, current_question=agent.current_question,review=agent.review_snapshot(),question_selected=agent._last_pick_succeeded)
         except OperationCancelled as exc:
             return error(str(exc),499,cancelled=True)
         except (ValueError,OSError) as exc:
@@ -354,6 +413,30 @@ def create_app(data_dir=None, client_factory=None, reader_factory=None, settings
                 return jsonify(ok=True, settings=settings.set_model(payload["model"]))
             except (ValueError, OSError) as exc:
                 return error(str(exc))
+
+    @app.post("/api/formula/matrix")
+    def formula_matrix():
+        """把一句自然语言描述转成矩阵 / 行列式的 LaTeX。
+
+        只做转写，不碰题库与笔记；返回的 LaTeX 由 formula_matrix 模块校验，
+        前端插入前还会再预览一次。
+        """
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("请求格式有误。")
+        try:
+            if not client_factory and not settings.public()["configured"]:
+                return error("请先在「模型设置」保存 API Key，再使用自然语言生成。")
+            latex = generate_matrix_latex(
+                make_client(),
+                payload.get("description"),
+                payload.get("kind") or "matrix",
+            )
+            return jsonify(ok=True, latex=latex)
+        except ValueError as exc:
+            return error(str(exc))
+        except ModelError as exc:
+            return error(str(exc), 502)
 
     @app.post("/api/settings/test")
     def test_settings():
@@ -1146,7 +1229,8 @@ def create_app(data_dir=None, client_factory=None, reader_factory=None, settings
             if view == "review":
                 for identity in image_ids:
                     state["review_images"].pop(identity, None);state["review_transcriptions"].pop(identity, None)
-            return jsonify(ok=True, answer=answer, events=events, proposals=proposals, current_question=agent.current_question)
+            return jsonify(ok=True, answer=answer, events=events, proposals=proposals, current_question=agent.current_question,
+                           **({"review":agent.review_snapshot()} if view=="review" else {}))
         except OperationCancelled as exc:
             if token.context_retained and view == "review":
                 # The retained conversation already contains these transcriptions.
